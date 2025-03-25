@@ -1,0 +1,30 @@
+{
+  "name": "voicemod",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bwallxyz/voicemod.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/bwallxyz/voicemod/issues"
+  },
+  "homepage": "https://github.com/bwallxyz/voicemod#readme",
+  "description": "",
+  "dependencies": {
+    "@discordjs/voice": "^0.18.0",
+    "axios": "^1.8.4",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7",
+    "mongodb": "^6.15.0",
+    "mongoose": "^8.13.0",
+    "prismjs": "^1.30.0"
+  }
+}
