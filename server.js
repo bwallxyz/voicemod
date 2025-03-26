@@ -2,9 +2,9 @@
 // This bot connects to voice channels, records conversations,
 // uses AI to transcribe and tag speakers, and optionally logs data to MongoDB
 
-const { Client, GatewayIntentBits, Partials, Events, InteractionType } = require('discord.js');
-const { createWriteStream, createReadStream } = require('fs');
-const { join } = require('path');
+const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -27,6 +27,13 @@ function debugLog(area, message, data = null) {
 
 // Set a global flag indicating if MongoDB should be used
 const USE_MONGODB = process.env.USE_MONGODB === 'true';
+
+// Create recordings directory if it doesn't exist
+const recordingsDir = path.join(__dirname, process.env.RECORDINGS_DIR || 'recordings');
+if (!fs.existsSync(recordingsDir)) {
+  debugLog('STARTUP', `Creating recordings directory: ${recordingsDir}`);
+  fs.mkdirSync(recordingsDir, { recursive: true });
+}
 
 // Only import database modules if MongoDB is enabled
 let connectDatabase, mongoose, transcriptionService, User;
@@ -69,6 +76,12 @@ const userSessions = new Map();
 // This example uses OpenAI's Whisper API, but you can substitute any speech-to-text API
 const TRANSCRIPTION_API_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const API_KEY = process.env.OPENAI_API_KEY;
+
+// Check for required environment variables
+if (!process.env.DISCORD_TOKEN) {
+  debugLog('ERROR', 'DISCORD_TOKEN is missing in .env file');
+  process.exit(1);
+}
 
 // Register command listeners
 client.once(Events.ClientReady, async () => {
@@ -388,10 +401,14 @@ async function stopTranscription(guildId, responseObj) {
 function respondToUser(responseObj, message) {
   if (responseObj.editReply) {
     // It's an interaction
-    responseObj.editReply(message);
+    responseObj.editReply(message).catch(err => {
+      debugLog('ERROR', `Failed to edit reply: ${err.message}`);
+    });
   } else {
     // It's a message
-    responseObj.reply(message);
+    responseObj.reply(message).catch(err => {
+      debugLog('ERROR', `Failed to reply to message: ${err.message}`);
+    });
   }
 }
 
@@ -417,184 +434,365 @@ function setupUserAudioReceiver(connection, userId, username) {
   // Create an audio receiver for this user
   const receiver = connection.receiver;
   
-  // Start listening to the user's audio
-  const audioStream = receiver.subscribe(userId, {
-    end: {
-      behavior: EndBehaviorType.AfterSilence,
-      duration: 500,
-    },
-  });
-  
-  userAudioStreams.set(guildUserId, audioStream);
-  
-  // Process the audio stream
-  const recordingStartTime = Date.now();
-  const outputPath = join(__dirname, process.env.RECORDINGS_DIR || 'recordings', `${guildUserId}-${recordingStartTime}.pcm`);
-  const outputStream = createWriteStream(outputPath);
-  
-  debugLog('AUDIO', `Created recording file: ${outputPath}`);
-  
-  audioStream.pipe(outputStream);
-  
-  // Set up a silence detection mechanism
-  let silenceStart = null;
-  let isSpeaking = false;
-  
-  audioStream.on('data', (chunk) => {
-    // Check if the chunk contains non-silence audio
-    const containsAudio = chunk.some(byte => byte !== 0);
+  try {
+    // Start listening to the user's audio with more robust error handling
+    const audioStream = receiver.subscribe(userId, {
+      end: {
+        behavior: EndBehaviorType.AfterSilence,
+        duration: 1000, // Increased from 500ms for more stability
+      },
+    });
     
-    if (containsAudio && !isSpeaking) {
-      isSpeaking = true;
-      silenceStart = null;
-      debugLog('AUDIO', `User ${username} started speaking`);
-    } else if (!containsAudio && isSpeaking) {
-      if (!silenceStart) {
-        silenceStart = Date.now();
-      } else if (Date.now() - silenceStart > (parseInt(process.env.SILENCE_DURATION) || 2000)) {
-        // If silence for more than configured duration, consider the speech finished
-        isSpeaking = false;
-        debugLog('AUDIO', `User ${username} finished speaking, processing audio from ${outputPath}`);
+    // Add error handling immediately
+    audioStream.on('error', (error) => {
+      debugLog('ERROR', `Audio stream error for ${username}: ${error.message}`);
+      // Remove from tracked streams if error occurs
+      userAudioStreams.delete(guildUserId);
+    });
+    
+    // Store in map only after adding error handler
+    userAudioStreams.set(guildUserId, audioStream);
+    
+    // Track active output streams for this user
+    const activeOutputStreams = new Set();
+    
+    // Process the audio stream
+    let recordingStartTime = Date.now();
+    let outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.pcm`);
+    let outputStream = fs.createWriteStream(outputPath);
+    
+    // Add to active streams set
+    activeOutputStreams.add(outputStream);
+    
+    debugLog('AUDIO', `Created recording file: ${outputPath}`);
+    
+    // Add error handler for output stream
+    outputStream.on('error', (err) => {
+      debugLog('ERROR', `Output stream error for ${username}: ${err.message}`);
+    });
+    
+    // Pipe with error handling
+    try {
+      audioStream.pipe(outputStream);
+    } catch (pipeError) {
+      debugLog('ERROR', `Failed to pipe audio stream: ${pipeError.message}`);
+    }
+    
+    // Set up a silence detection mechanism with recovery capability
+    let silenceStart = null;
+    let isSpeaking = false;
+    let lastActivity = Date.now();
+    
+    // Add a watchdog timer to detect stalled streams
+    const watchdogInterval = setInterval(() => {
+      if (Date.now() - lastActivity > 60000) { // 1 minute of inactivity
+        debugLog('WATCHDOG', `No activity for ${username} in 60 seconds, resetting connection`);
         
-        // Get voice channel and guild information
-        const guild = client.guilds.cache.get(connection.joinConfig.guildId);
-        const channel = guild.channels.cache.get(connection.joinConfig.channelId);
-        
-        // Get full user info
-        const member = guild.members.cache.get(userId);
-        const displayName = member ? member.displayName : username;
-        
-        // Use MongoDB if available
-        if (USE_MONGODB && mongoose && mongoose.connection.readyState === 1) {
-          debugLog('MONGO', `Using MongoDB transcription service for ${username}`);
+        // Reset the receiver by recreating it
+        try {
+          // Clean up first
+          clearInterval(watchdogInterval);
           
-          // Prepare context data for transcription
-          const contextData = {
-            guildId: guild.id,
-            guildName: guild.name,
-            channelId: channel.id,
-            channelName: channel.name
-          };
+          // Remove the old stream
+          if (userAudioStreams.has(guildUserId)) {
+            const oldStream = userAudioStreams.get(guildUserId);
+            oldStream.unpipe();
+            oldStream.destroy();
+            userAudioStreams.delete(guildUserId);
+          }
           
-          // Prepare user data
-          const userData = {
-            userId: userId,
-            username: username,
-            displayName: displayName
-          };
-          
-          debugLog('CONTEXT', 'Transcription context', contextData);
-          debugLog('USER', 'User data', userData);
-          
-          // Transcribe the audio and save to database
-          transcriptionService.transcribeAndSave(
-            outputPath, 
-            userData, 
-            contextData, 
-            recordingStartTime
-          ).then(result => {
-            if (result && result.text) {
-              debugLog('TRANSCRIPTION', `Success for ${result.username}: "${result.text}"`);
-              // Send the transcription to the text channel
-              const textChannelId = guild.systemChannelId;
-              const textChannel = client.channels.cache.get(textChannelId);
-              
-              if (textChannel) {
-                textChannel.send(`**${result.username}**: ${result.text}`);
-              }
-            } else {
-              debugLog('TRANSCRIPTION', `Empty result for ${username}`);
+          // Clean up streams
+          for (const stream of activeOutputStreams) {
+            try {
+              stream.end();
+            } catch (err) {
+              debugLog('ERROR', `Error ending stream in watchdog: ${err.message}`);
             }
-          }).catch(error => {
-            debugLog('ERROR', `Transcription service error: ${error.message}`);
-            // Fallback to direct transcription on error
-            transcribeAudio(outputPath, guildUserId).then(handleTranscription);
-          });
-        } else {
-          debugLog('DIRECT', `Using direct API transcription for ${username}`);
-          transcribeAudio(outputPath, guildUserId).then(handleTranscription);
+          }
+          activeOutputStreams.clear();
+          
+          // Wait a second before trying to reconnect
+          setTimeout(() => {
+            debugLog('WATCHDOG', `Attempting to reconnect audio for ${username}`);
+            setupUserAudioReceiver(connection, userId, username);
+          }, 1000);
+        } catch (resetError) {
+          debugLog('ERROR', `Error in watchdog reset: ${resetError.message}`);
         }
-        
-        // Function to handle transcription result
-        function handleTranscription(result) {
-          if (result && result.text) {
-            debugLog('TRANSCRIPTION', `Direct API success: "${result.text}"`);
-            const userSession = userSessions.get(guildUserId);
+      }
+    }, 10000); // Check every 10 seconds
+    
+    audioStream.on('data', (chunk) => {
+      // Update watchdog timestamp
+      lastActivity = Date.now();
+      
+      // Check if the chunk contains non-silence audio (more robust check)
+      let containsAudio = false;
+      
+      // Sample at least 20% of the buffer for non-zero values
+      const sampleSize = Math.max(100, Math.floor(chunk.length * 0.2));
+      const step = Math.floor(chunk.length / sampleSize);
+      
+      for (let i = 0; i < chunk.length; i += step) {
+        if (chunk[i] !== 0) {
+          containsAudio = true;
+          break;
+        }
+      }
+      
+      if (containsAudio && !isSpeaking) {
+        isSpeaking = true;
+        silenceStart = null;
+        debugLog('AUDIO', `User ${username} started speaking`);
+      } else if (!containsAudio && isSpeaking) {
+        if (!silenceStart) {
+          silenceStart = Date.now();
+        } else if (Date.now() - silenceStart > (parseInt(process.env.SILENCE_DURATION) || 2000)) {
+          // If silence for more than configured duration, consider the speech finished
+          isSpeaking = false;
+          debugLog('AUDIO', `User ${username} finished speaking, processing audio from ${outputPath}`);
+          
+          try {
+            // Get voice channel and guild information
+            const guild = client.guilds.cache.get(connection.joinConfig.guildId);
+            const channel = guild.channels.cache.get(connection.joinConfig.channelId);
             
-            if (channel && userSession) {
-              // Send the transcription to the text channel
-              const textChannelId = guild.systemChannelId;
-              const textChannel = client.channels.cache.get(textChannelId);
+            // Get full user info
+            const member = guild.members.cache.get(userId);
+            const displayName = member ? member.displayName : username;
+            
+            // Store current output path and start time for transcription
+            const currentOutputPath = outputPath;
+            const currentStartTime = recordingStartTime;
+            
+            // IMPORTANT: Create a local reference to this output stream
+            const currentOutputStream = outputStream;
+            
+            // Create new recording file before doing anything with the old one
+            // Start a new recording file (IMPORTANT: Do this BEFORE ending the old stream)
+            debugLog('AUDIO', `Starting new recording for ${username}`);
+            
+            // Create new recording stream
+            recordingStartTime = Date.now();
+            outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.pcm`);
+            outputStream = fs.createWriteStream(outputPath);
+            
+            // Add error handler for the new output stream
+            outputStream.on('error', (err) => {
+              debugLog('ERROR', `Output stream error for ${username}: ${err.message}`);
+            });
+            
+            // Add the new stream to active streams
+            activeOutputStreams.add(outputStream);
+            
+            try {
+              // IMPORTANT: Unpipe BEFORE ending the old stream
+              audioStream.unpipe(currentOutputStream);
               
-              if (textChannel) {
-                textChannel.send(`**${userSession.username}**: ${result.text}`);
-              }
-              
-              // Update the user's last transcription time
-              userSession.lastTranscription = Date.now();
+              // Now pipe to the new stream
+              audioStream.pipe(outputStream);
+            } catch (pipeError) {
+              debugLog('ERROR', `Failed to switch pipes: ${pipeError.message}`);
             }
-          } else {
-            debugLog('TRANSCRIPTION', `Direct API failed for ${username}`);
+            
+            // Use MongoDB if available
+            if (USE_MONGODB && mongoose && mongoose.connection.readyState === 1) {
+              debugLog('MONGO', `Using MongoDB transcription service for ${username}`);
+              
+              // Prepare context data for transcription
+              const contextData = {
+                guildId: guild.id,
+                guildName: guild.name,
+                channelId: channel.id,
+                channelName: channel.name
+              };
+              
+              // Prepare user data
+              const userData = {
+                userId: userId,
+                username: username,
+                displayName: displayName
+              };
+              
+              debugLog('CONTEXT', 'Transcription context', contextData);
+              debugLog('USER', 'User data', userData);
+              
+              // Transcribe the audio and save to database
+              transcriptionService.transcribeAndSave(
+                currentOutputPath, 
+                userData, 
+                contextData, 
+                currentStartTime
+              ).then(result => {
+                if (result && result.text) {
+                  debugLog('TRANSCRIPTION', `Success for ${result.username}: "${result.text}"`);
+                  // Send the transcription to the text channel
+                  const textChannelId = guild.systemChannelId;
+                  const textChannel = client.channels.cache.get(textChannelId);
+                  
+                  if (textChannel) {
+                    textChannel.send(`**${result.username}**: ${result.text}`);
+                  }
+                } else {
+                  debugLog('TRANSCRIPTION', `Empty result for ${username}`);
+                }
+              }).catch(error => {
+                debugLog('ERROR', `Transcription service error: ${error.message}`);
+                // Fallback to direct transcription on error
+                transcribeAudio(currentOutputPath, guildUserId).then(handleTranscription);
+              }).finally(() => {
+                // Clean up the stream reference from active streams set
+                activeOutputStreams.delete(currentOutputStream);
+                
+                // Safely end the previous stream and avoid race conditions
+                setTimeout(() => {
+                  try {
+                    currentOutputStream.end();
+                  } catch (err) {
+                    debugLog('ERROR', `Error ending stream: ${err.message}`);
+                  }
+                }, 500);
+              });
+            } else {
+              debugLog('DIRECT', `Using direct API transcription for ${username}`);
+              transcribeAudio(currentOutputPath, guildUserId)
+                .then(handleTranscription)
+                .finally(() => {
+                  // Clean up the stream reference from active streams set
+                  activeOutputStreams.delete(currentOutputStream);
+                  
+                  // Safely end the previous stream and avoid race conditions
+                  setTimeout(() => {
+                    try {
+                      currentOutputStream.end();
+                    } catch (err) {
+                      debugLog('ERROR', `Error ending stream: ${err.message}`);
+                    }
+                  }, 500);
+                });
+            }
+            
+            // Function to handle transcription result
+            function handleTranscription(result) {
+              if (result && result.text) {
+                debugLog('TRANSCRIPTION', `Direct API success: "${result.text}"`);
+                const userSession = userSessions.get(guildUserId);
+                
+                if (channel && userSession) {
+                  // Send the transcription to the text channel
+                  const textChannelId = guild.systemChannelId;
+                  const textChannel = client.channels.cache.get(textChannelId);
+                  
+                  if (textChannel) {
+                    textChannel.send(`**${userSession.username}**: ${result.text}`);
+                  }
+                  
+                  // Update the user's last transcription time
+                  userSession.lastTranscription = Date.now();
+                }
+              } else {
+                debugLog('TRANSCRIPTION', `Direct API failed for ${username}`);
+              }
+            }
+          } catch (processingError) {
+            debugLog('ERROR', `Error processing end of speech: ${processingError.message}`);
           }
         }
-        
-        // Start a new recording file
-        debugLog('AUDIO', `Starting new recording for ${username}`);
-        audioStream.unpipe(outputStream);
-        outputStream.end();
-        
-        const newStartTime = Date.now();
-        const newOutputPath = join(__dirname, process.env.RECORDINGS_DIR || 'recordings', `${guildUserId}-${newStartTime}.pcm`);
-        const newOutputStream = createWriteStream(newOutputPath);
-        
-        audioStream.pipe(newOutputStream);
       }
+    });
+    
+    // Handle stream closing with more robustness
+    audioStream.on('close', (reason) => {
+      debugLog('AUDIO', `Audio stream closed for user: ${username}, reason: ${reason || 'unknown'}`);
+      
+      // Clear the watchdog
+      clearInterval(watchdogInterval);
+      
+      // Properly clean up all active streams
+      for (const stream of activeOutputStreams) {
+        try {
+          stream.end();
+        } catch (err) {
+          debugLog('ERROR', `Error ending stream on close: ${err.message}`);
+        }
+      }
+      
+      // Clear the active streams set
+      activeOutputStreams.clear();
+      
+      // Remove from tracked audio streams
+      userAudioStreams.delete(guildUserId);
+      
+      // Try to recover automatically after a short delay
+      setTimeout(() => {
+        if (!userAudioStreams.has(guildUserId) && connection && !connection.destroyed) {
+          debugLog('RECOVERY', `Attempting to recover audio for ${username}`);
+          setupUserAudioReceiver(connection, userId, username);
+        }
+      }, 2000);
+    });
+    
+  } catch (setupError) {
+    debugLog('ERROR', `Failed to set up audio receiver: ${setupError.message}`);
+    
+    // Try again after a delay
+    setTimeout(() => {
+      debugLog('RECOVERY', `Retrying setup for ${username}`);
+      if (!userAudioStreams.has(guildUserId)) {
+        setupUserAudioReceiver(connection, userId, username);
     }
-  });
-  
-  // Handle stream closing
-  audioStream.on('close', (reason) => {
-    debugLog('AUDIO', `Audio stream closed for user: ${username}, reason: ${reason || 'unknown'}`);
-    outputStream.end();
-    userAudioStreams.delete(guildUserId);
-  });
-  
-  // Handle stream errors
-  audioStream.on('error', (error) => {
-    debugLog('ERROR', `Audio stream error for ${username}: ${error.message}`);
-  });
+  }, 3000);
+}
 }
 
 // Fallback function to transcribe audio using the API directly (if database connection fails)
 async function transcribeAudio(audioFilePath, userId) {
-  debugLog('API', `Transcribing file: ${audioFilePath}`);
-  try {
-    const formData = new FormData();
-    formData.append('file', createReadStream(audioFilePath));
-    formData.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
-    formData.append('response_format', 'json');
-    
-    debugLog('API', 'Sending request to OpenAI API...');
-    
-    const response = await axios.post(TRANSCRIPTION_API_URL, formData, {
-      headers: {
-        'Authorization': `Bearer ${API_KEY}`,
-        'Content-Type': 'multipart/form-data'
-      }
-    });
-    
-    debugLog('API', `Transcription completed for ${userId}`);
-    
-    return {
-      text: response.data.text,
-      userId: userId
-    };
-  } catch (error) {
-    debugLog('ERROR', `API Transcription error: ${error.message}`);
+debugLog('API', `Transcribing file: ${audioFilePath}`);
+try {
+  // First check if file exists
+  if (!fs.existsSync(audioFilePath)) {
+    debugLog('ERROR', `Audio file not found: ${audioFilePath}`);
     return null;
   }
+  
+  // Check file size - if too small, probably not worth transcribing
+  const stats = fs.statSync(audioFilePath);
+  if (stats.size < 1000) {
+    debugLog('API', `Audio file too small to transcribe: ${audioFilePath} (${stats.size} bytes)`);
+    return null;
+  }
+  
+  // Create form data
+  const form = new FormData();
+  form.append('file', fs.createReadStream(audioFilePath));
+  form.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
+  form.append('response_format', 'json');
+  
+  debugLog('API', 'Sending request to OpenAI API...');
+  
+  const response = await axios.post(TRANSCRIPTION_API_URL, form, {
+    headers: {
+      'Authorization': `Bearer ${API_KEY}`,
+      'Content-Type': 'multipart/form-data'
+    }
+  });
+  
+  debugLog('API', `Transcription completed for ${userId}`);
+  
+  return {
+    text: response.data.text,
+    userId: userId
+  };
+} catch (error) {
+  debugLog('ERROR', `API Transcription error: ${error.message}`);
+  return null;
+}
 }
 
 // Log in to Discord
 debugLog('STARTUP', 'Logging in to Discord...');
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN)
+.catch(error => {
+  debugLog('ERROR', `Failed to login to Discord: ${error.message}`);
+  process.exit(1);
+});
