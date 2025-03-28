@@ -7,7 +7,18 @@ const token = process.env.DISCORD_TOKEN;
 
 // Your bot's client ID (application ID)
 // You can find this in the Discord Developer Portal
-const clientId = process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE';
+const clientId = process.env.CLIENT_ID;
+
+// Check if token and client ID are available
+if (!token) {
+  console.error('Error: DISCORD_TOKEN is missing in your .env file');
+  process.exit(1);
+}
+
+if (!clientId) {
+  console.error('Error: CLIENT_ID is missing in your .env file');
+  process.exit(1);
+}
 
 // Create a new REST instance
 const rest = new REST({ version: '10' }).setToken(token);
@@ -62,10 +73,10 @@ clearGuildCommands(guildId);
 /*
  * To use this script:
  * 
- * 1. Add your CLIENT_ID to your .env file or replace it in this file
+ * 1. Make sure your .env file contains CLIENT_ID and DISCORD_TOKEN
  * 2. To clear both global and guild commands:
- *    node clear-commands.js YOUR_GUILD_ID
+ *    node scripts/clear-commands.js YOUR_GUILD_ID
  * 
  * 3. To clear only global commands:
- *    node clear-commands.js
+ *    node scripts/clear-commands.js
  */

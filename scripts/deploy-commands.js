@@ -1,12 +1,24 @@
 // Script to deploy slash commands to a specific guild/server
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes } = require('discord.js');
+const { SlashCommandBuilder } = require('@discordjs/builders');
 require('dotenv').config();
 
 // Your bot's token from the .env file
 const token = process.env.DISCORD_TOKEN;
 
 // Your bot's client ID (application ID)
-const clientId = process.env.CLIENT_ID || 'YOUR_CLIENT_ID_HERE';
+const clientId = process.env.CLIENT_ID;
+
+// Check if token and client ID are available
+if (!token) {
+  console.error('Error: DISCORD_TOKEN is missing in your .env file');
+  process.exit(1);
+}
+
+if (!clientId) {
+  console.error('Error: CLIENT_ID is missing in your .env file');
+  process.exit(1);
+}
 
 // Define the commands for your bot
 const commands = [
@@ -81,10 +93,10 @@ deployCommands(guildId);
 /*
  * To use this script:
  * 
- * 1. Add your CLIENT_ID to your .env file or replace it in this file
+ * 1. Make sure your .env file contains CLIENT_ID and DISCORD_TOKEN
  * 2. To deploy to a specific guild/server (recommended during development):
- *    node deploy-commands.js YOUR_GUILD_ID
+ *    node scripts/deploy-commands.js YOUR_GUILD_ID
  * 
  * 3. To deploy globally to all servers (takes up to an hour to propagate):
- *    node deploy-commands.js
+ *    node scripts/deploy-commands.js
  */

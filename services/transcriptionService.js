@@ -1,8 +1,8 @@
-// Modified version of transcriptionService.js with detailed logging
+// services/transcriptionService.js - Simplified for WAV files
 
-// services/transcriptionService.js
 const axios = require('axios');
 const fs = require('fs');
+const FormData = require('form-data');
 const User = require('../models/User');
 
 // Add the debug logging function
@@ -18,7 +18,12 @@ class TranscriptionService {
   constructor() {
     this.apiUrl = 'https://api.openai.com/v1/audio/transcriptions';
     this.apiKey = process.env.OPENAI_API_KEY;
-    debugLog('SERVICE', 'TranscriptionService initialized with API key');
+    
+    if (!this.apiKey) {
+      debugLog('ERROR', 'OPENAI_API_KEY is missing in .env file');
+    } else {
+      debugLog('SERVICE', 'TranscriptionService initialized with API key');
+    }
   }
 
   /**
@@ -38,30 +43,44 @@ class TranscriptionService {
         return null;
       }
       
-      debugLog('SERVICE', `Audio file exists: ${audioFilePath}`);
-      
-      // 2. Get audio file info and calculate duration
+      // 2. Check file size - if too small, probably not worth transcribing
       const stats = fs.statSync(audioFilePath);
-      debugLog('SERVICE', `File size: ${stats.size} bytes`);
+      debugLog('SERVICE', `Audio file exists: ${audioFilePath}, size: ${stats.size} bytes`);
+      
+      if (stats.size < 1000) {
+        debugLog('SERVICE', `Audio file too small to transcribe: ${audioFilePath} (${stats.size} bytes)`);
+        return null;
+      }
       
       const endTime = Date.now();
       const duration = startTime ? endTime - startTime : 0;
       
       // 3. Prepare request to transcription API
-      debugLog('API', `Preparing API request for file: ${audioFilePath}`);
+      debugLog('API', `Preparing API request for WAV file: ${audioFilePath}`);
       
       const formData = new FormData();
-      formData.append('file', fs.createReadStream(audioFilePath));
-      formData.append('model', 'whisper-1');
+      
+      formData.append('file', fs.createReadStream(audioFilePath), {
+        filename: 'audio.wav',
+        contentType: 'audio/wav'
+      });
+      formData.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
       formData.append('response_format', 'json');
       
       // 4. Call the API
       debugLog('API', 'Sending request to OpenAI API...');
+      
+      if (!this.apiKey) {
+        throw new Error('OpenAI API key is missing');
+      }
+      
       const response = await axios.post(this.apiUrl, formData, {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'multipart/form-data'
-        }
+          ...formData.getHeaders()
+        },
+        maxBodyLength: Infinity, // For larger audio files
+        timeout: 60000 // Increase timeout for larger files (60s)
       });
       
       // 5. Get transcription result
@@ -71,9 +90,9 @@ class TranscriptionService {
       // 6. Find or create the user in database
       debugLog('MONGO', `Finding/creating user: ${userData.userId}`);
       
-      // Check if MongoDB is connected
-      if (User.db.readyState !== 1) {
-        debugLog('ERROR', `MongoDB not connected. ReadyState: ${User.db.readyState}`);
+      // Check if MongoDB is connected properly
+      if (!User.db || User.db.readyState !== 1) {
+        debugLog('ERROR', `MongoDB not connected. ReadyState: ${User.db ? User.db.readyState : 'undefined'}`);
         return {
           text: transcriptionResult.text,
           userId: userData.userId,
@@ -82,11 +101,25 @@ class TranscriptionService {
         };
       }
       
-      const user = await User.findOrCreateUser({
-        userId: userData.userId,
-        username: userData.username,
-        displayName: userData.displayName || userData.username
-      });
+      let user;
+      try {
+        // First try to find the user
+        user = await User.findOne({ userId: userData.userId });
+        
+        // If user doesn't exist, create new user
+        if (!user) {
+          debugLog('MONGO', `User not found, creating new user: ${userData.userId}`);
+          user = new User({
+            userId: userData.userId,
+            username: userData.username,
+            displayName: userData.displayName || userData.username
+          });
+          await user.save();
+        }
+      } catch (dbError) {
+        debugLog('ERROR', `Error finding/creating user: ${dbError.message}`);
+        throw dbError;
+      }
       
       debugLog('MONGO', `User found/created: ${user.username}`, {
         userId: user.userId,
@@ -103,7 +136,7 @@ class TranscriptionService {
         guildId: contextData.guildId,
         guildName: contextData.guildName,
         duration: duration,
-        confidenceScore: transcriptionResult.confidence || 0,
+        confidenceScore: transcriptionResult.confidence ? transcriptionResult.confidence * 100 : 0,
         audioFilePath: process.env.STORE_AUDIO_FILES === 'true' ? audioFilePath : null
       };
       
@@ -116,12 +149,19 @@ class TranscriptionService {
       return {
         text: transcriptionResult.text,
         userId: userData.userId,
-        username: userData.username,
+        username: userData.username || userData.displayName,
         duration: duration
       };
     } catch (error) {
       debugLog('ERROR', `Transcription or database error: ${error.message}`);
       debugLog('ERROR', error.stack);
+      
+      // Return error details for debugging
+      if (error.response) {
+        debugLog('ERROR', `API Status: ${error.response.status}`);
+        debugLog('ERROR', 'API Response:', error.response.data);
+      }
+      
       return null;
     }
   }
@@ -133,13 +173,12 @@ class TranscriptionService {
     debugLog('SERVICE', `getUserTranscriptions called for ${userId}`, options);
     
     try {
-      const query = { userId };
       const limit = options.limit || 100;
       const skip = options.skip || 0;
       
       // Get the user
       debugLog('MONGO', `Finding user: ${userId}`);
-      const user = await User.findOne(query);
+      const user = await User.findOne({ userId });
       
       if (!user) {
         debugLog('MONGO', `User not found: ${userId}`);
@@ -149,7 +188,7 @@ class TranscriptionService {
       debugLog('MONGO', `User found with ${user.transcriptions.length} transcriptions`);
       
       // Get transcriptions with filtering
-      let transcriptions = user.transcriptions;
+      let transcriptions = user.transcriptions || [];
       
       // Apply filters if provided
       if (options.guildId) {

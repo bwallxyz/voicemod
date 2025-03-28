@@ -2,7 +2,73 @@
 // This bot connects to voice channels, records conversations,
 // uses AI to transcribe and tag speakers, and optionally logs data to MongoDB
 
-const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, Events } = require('discord.js')
+
+// Fallback function to transcribe audio using the API directly (if database connection fails)
+async function transcribeAudio(audioFilePath, userId) {
+  debugLog('API', `Transcribing file: ${audioFilePath}`);
+  try {
+    // First check if file exists
+    if (!fs.existsSync(audioFilePath)) {
+      debugLog('ERROR', `Audio file not found: ${audioFilePath}`);
+      return null;
+    }
+    
+    // Check file size - if too small, probably not worth transcribing
+    const stats = fs.statSync(audioFilePath);
+    if (stats.size < 1000) {
+      debugLog('API', `Audio file too small to transcribe: ${audioFilePath} (${stats.size} bytes)`);
+      return null;
+    }
+    
+    // Create form data - ensure FormData is properly imported
+    const form = new FormData();
+    
+    form.append('file', fs.createReadStream(audioFilePath), {
+      filename: 'audio.wav',
+      contentType: 'audio/wav'
+    });
+    form.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
+    form.append('response_format', 'json');
+    
+    // Check for API key
+    if (!API_KEY) {
+      debugLog('ERROR', 'Missing OpenAI API key');
+      return null;
+    }
+    
+    debugLog('API', 'Sending request to OpenAI API...');
+    
+    const response = await axios.post(TRANSCRIPTION_API_URL, form, {
+      headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        ...form.getHeaders()
+      },
+      maxBodyLength: Infinity, // For larger audio files
+      timeout: 60000 // Increase timeout for larger files (60s)
+    });
+    
+    if (response.data && response.data.text) {
+      debugLog('API', `Transcription completed for ${userId}: "${response.data.text}"`);
+      
+      return {
+        text: response.data.text,
+        userId: userId
+      };
+    } else {
+      debugLog('ERROR', 'Empty response from OpenAI API');
+      return null;
+    }
+  } catch (error) {
+    debugLog('ERROR', `API Transcription error: ${error.message}`);
+    if (error.response) {
+      debugLog('ERROR', `API Response Status: ${error.response.status}`);
+      debugLog('ERROR', `API Response Data:`, error.response.data);
+    }
+    return null;
+  }
+}
+
 const fs = require('fs');
 const path = require('path');
 const {
@@ -14,6 +80,8 @@ const {
   EndBehaviorType
 } = require('@discordjs/voice');
 const axios = require('axios');
+const FormData = require('form-data');
+const prism = require('prism-media');
 require('dotenv').config();
 
 // Debug logging function with timestamps
@@ -23,6 +91,31 @@ function debugLog(area, message, data = null) {
   if (data) {
     console.log(JSON.stringify(data, null, 2));
   }
+}
+
+// Check critical environment variables
+const criticalEnvVars = [
+  'DISCORD_TOKEN',
+  'OPENAI_API_KEY'
+];
+
+let missingVars = [];
+criticalEnvVars.forEach(varName => {
+  if (!process.env[varName]) {
+    missingVars.push(varName);
+  }
+});
+
+if (missingVars.length > 0) {
+  console.error('❌ Missing critical environment variables:', missingVars.join(', '));
+  console.error('Please check your .env file');
+  process.exit(1);
+}
+
+// Try disabling MongoDB temporarily if it's causing issues
+if (process.env.DISABLE_MONGODB === 'true') {
+  console.log('MongoDB is disabled by DISABLE_MONGODB environment variable');
+  process.env.USE_MONGODB = 'false';
 }
 
 // Set a global flag indicating if MongoDB should be used
@@ -77,12 +170,6 @@ const userSessions = new Map();
 const TRANSCRIPTION_API_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const API_KEY = process.env.OPENAI_API_KEY;
 
-// Check for required environment variables
-if (!process.env.DISCORD_TOKEN) {
-  debugLog('ERROR', 'DISCORD_TOKEN is missing in .env file');
-  process.exit(1);
-}
-
 // Register command listeners
 client.once(Events.ClientReady, async () => {
   debugLog('STARTUP', `Logged in as ${client.user.tag}!`);
@@ -97,13 +184,20 @@ client.once(Events.ClientReady, async () => {
         
         // Test database write
         try {
-          const testUser = new User({
-            userId: 'test-user-id',
-            username: 'test-user'
-          });
+          // First check if test user already exists to avoid duplicate key error
+          const existingUser = await User.findOne({ userId: 'test-user-id' });
           
-          await testUser.save();
-          debugLog('MONGO', 'Test user saved successfully');
+          if (!existingUser) {
+            const testUser = new User({
+              userId: 'test-user-id',
+              username: 'test-user'
+            });
+            
+            await testUser.save();
+            debugLog('MONGO', 'Test user saved successfully');
+          } else {
+            debugLog('MONGO', 'Test user already exists, skipping creation');
+          }
           
           // Try finding the user
           const foundUser = await User.findOne({ userId: 'test-user-id' });
@@ -456,24 +550,42 @@ function setupUserAudioReceiver(connection, userId, username) {
     // Track active output streams for this user
     const activeOutputStreams = new Set();
     
-    // Process the audio stream
+    // Process the audio stream - USING WAV INSTEAD OF PCM
     let recordingStartTime = Date.now();
-    let outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.pcm`);
+    let outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.wav`);
+    debugLog('AUDIO', `Creating WAV recording file: ${outputPath}`);
+    
+    // Create a WAV encoder
+    const wavEncoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 })
+      .pipe(new prism.VolumeTransformer({ type: 's16le' }))
+      .pipe(new prism.PCMToWav({ 
+        sampleRate: 48000, 
+        channels: 2,
+        format: 's16le'
+      }));
+    
+    // Create file write stream
     let outputStream = fs.createWriteStream(outputPath);
     
     // Add to active streams set
     activeOutputStreams.add(outputStream);
+    activeOutputStreams.add(wavEncoder);
     
     debugLog('AUDIO', `Created recording file: ${outputPath}`);
     
-    // Add error handler for output stream
+    // Add error handlers
+    wavEncoder.on('error', (err) => {
+      debugLog('ERROR', `WAV encoder error for ${username}: ${err.message}`);
+    });
+    
     outputStream.on('error', (err) => {
       debugLog('ERROR', `Output stream error for ${username}: ${err.message}`);
     });
     
     // Pipe with error handling
     try {
-      audioStream.pipe(outputStream);
+      // Connect the audio stream to the WAV encoder to the file
+      audioStream.pipe(wavEncoder).pipe(outputStream);
     } catch (pipeError) {
       debugLog('ERROR', `Failed to pipe audio stream: ${pipeError.message}`);
     }
@@ -565,32 +677,49 @@ function setupUserAudioReceiver(connection, userId, username) {
             const currentOutputPath = outputPath;
             const currentStartTime = recordingStartTime;
             
-            // IMPORTANT: Create a local reference to this output stream
+            // IMPORTANT: Create a local reference to this output stream and wav encoder
             const currentOutputStream = outputStream;
+            const currentWavEncoder = wavEncoder;
             
             // Create new recording file before doing anything with the old one
             // Start a new recording file (IMPORTANT: Do this BEFORE ending the old stream)
             debugLog('AUDIO', `Starting new recording for ${username}`);
             
-            // Create new recording stream
+            // Create new recording stream with WAV encoding
             recordingStartTime = Date.now();
-            outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.pcm`);
+            outputPath = path.join(recordingsDir, `${guildUserId}-${recordingStartTime}.wav`);
+            
+            // Create a new WAV encoder
+            wavEncoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 })
+              .pipe(new prism.VolumeTransformer({ type: 's16le' }))
+              .pipe(new prism.PCMToWav({ 
+                sampleRate: 48000, 
+                channels: 2,
+                format: 's16le'
+              }));
+            
+            // Create new output stream
             outputStream = fs.createWriteStream(outputPath);
             
-            // Add error handler for the new output stream
+            // Add the new stream to active streams
+            activeOutputStreams.add(outputStream);
+            activeOutputStreams.add(wavEncoder);
+            
+            // Add error handlers
+            wavEncoder.on('error', (err) => {
+              debugLog('ERROR', `WAV encoder error for ${username}: ${err.message}`);
+            });
+            
             outputStream.on('error', (err) => {
               debugLog('ERROR', `Output stream error for ${username}: ${err.message}`);
             });
             
-            // Add the new stream to active streams
-            activeOutputStreams.add(outputStream);
-            
             try {
               // IMPORTANT: Unpipe BEFORE ending the old stream
-              audioStream.unpipe(currentOutputStream);
+              audioStream.unpipe(currentWavEncoder);
               
-              // Now pipe to the new stream
-              audioStream.pipe(outputStream);
+              // Now pipe to the new wav encoder and stream
+              audioStream.pipe(wavEncoder).pipe(outputStream);
             } catch (pipeError) {
               debugLog('ERROR', `Failed to switch pipes: ${pipeError.message}`);
             }
@@ -643,10 +772,12 @@ function setupUserAudioReceiver(connection, userId, username) {
               }).finally(() => {
                 // Clean up the stream reference from active streams set
                 activeOutputStreams.delete(currentOutputStream);
+                activeOutputStreams.delete(currentWavEncoder);
                 
                 // Safely end the previous stream and avoid race conditions
                 setTimeout(() => {
                   try {
+                    currentWavEncoder.end();
                     currentOutputStream.end();
                   } catch (err) {
                     debugLog('ERROR', `Error ending stream: ${err.message}`);
@@ -660,10 +791,12 @@ function setupUserAudioReceiver(connection, userId, username) {
                 .finally(() => {
                   // Clean up the stream reference from active streams set
                   activeOutputStreams.delete(currentOutputStream);
+                  activeOutputStreams.delete(currentWavEncoder);
                   
                   // Safely end the previous stream and avoid race conditions
                   setTimeout(() => {
                     try {
+                      currentWavEncoder.end();
                       currentOutputStream.end();
                     } catch (err) {
                       debugLog('ERROR', `Error ending stream: ${err.message}`);
@@ -740,59 +873,16 @@ function setupUserAudioReceiver(connection, userId, username) {
       debugLog('RECOVERY', `Retrying setup for ${username}`);
       if (!userAudioStreams.has(guildUserId)) {
         setupUserAudioReceiver(connection, userId, username);
-    }
-  }, 3000);
-}
+      }
+    }, 3000);
+  }
 }
 
-// Fallback function to transcribe audio using the API directly (if database connection fails)
-async function transcribeAudio(audioFilePath, userId) {
-debugLog('API', `Transcribing file: ${audioFilePath}`);
-try {
-  // First check if file exists
-  if (!fs.existsSync(audioFilePath)) {
-    debugLog('ERROR', `Audio file not found: ${audioFilePath}`);
-    return null;
-  }
-  
-  // Check file size - if too small, probably not worth transcribing
-  const stats = fs.statSync(audioFilePath);
-  if (stats.size < 1000) {
-    debugLog('API', `Audio file too small to transcribe: ${audioFilePath} (${stats.size} bytes)`);
-    return null;
-  }
-  
-  // Create form data
-  const form = new FormData();
-  form.append('file', fs.createReadStream(audioFilePath));
-  form.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
-  form.append('response_format', 'json');
-  
-  debugLog('API', 'Sending request to OpenAI API...');
-  
-  const response = await axios.post(TRANSCRIPTION_API_URL, form, {
-    headers: {
-      'Authorization': `Bearer ${API_KEY}`,
-      'Content-Type': 'multipart/form-data'
-    }
-  });
-  
-  debugLog('API', `Transcription completed for ${userId}`);
-  
-  return {
-    text: response.data.text,
-    userId: userId
-  };
-} catch (error) {
-  debugLog('ERROR', `API Transcription error: ${error.message}`);
-  return null;
-}
-}
 
 // Log in to Discord
-debugLog('STARTUP', 'Logging in to Discord...');
+console.log('Logging in to Discord...');
 client.login(process.env.DISCORD_TOKEN)
 .catch(error => {
-  debugLog('ERROR', `Failed to login to Discord: ${error.message}`);
+  console.error(`Failed to login to Discord: ${error.message}`);
   process.exit(1);
 });
